@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>ESP32 Program Switcher</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1b1d21; --muted: #6b7280;
+    --accent: #2563eb; --accent-text: #ffffff; --btn: #e5e7eb; --danger: #dc2626; --ok: #16a34a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318; --card: #1c1f26; --text: #f1f2f4; --muted: #9aa0ab;
+      --accent: #3b82f6; --btn: #2a2e38; --danger: #ef4444; --ok: #22c55e;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { max-width: 480px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .card { background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  #status { font-size: 14px; color: var(--muted); }
+  #status.on { color: var(--ok); font-weight: 600; }
+  button { font: inherit; border: 0; border-radius: 14px; background: var(--btn); color: var(--text);
+    padding: 14px; font-weight: 600; touch-action: none; user-select: none; -webkit-user-select: none; }
+  button:active, button.active { background: var(--accent); color: var(--accent-text); }
+  #connect { background: var(--accent); color: var(--accent-text); padding: 12px 18px; }
+  .progs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .pad button { height: 78px; font-size: 24px; }
+  .pad .stop { background: var(--danger); color: #fff; }
+  .label { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  #log { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted);
+    height: 110px; overflow-y: auto; white-space: pre-wrap; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .small { padding: 8px 12px; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>ESP32 Program Switcher</h1>
+
+  <div class="card row">
+    <span id="status">Not connected</span>
+    <button id="connect">Connect</button>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <p class="label" style="margin:0">Programs on the ESP32 (tap to run)</p>
+      <button class="small" id="refresh">Refresh</button>
+    </div>
+    <div class="progs" id="progs"><span class="hint">Connect to load the list.</span></div>
+  </div>
+
+  <div class="card">
+    <p class="label">Drive (hold to move, release to stop) - used by the Manual program</p>
+    <div class="pad">
+      <span></span><button data-drive="F">▲</button><span></span>
+      <button data-drive="L">◀</button><button class="stop" id="stopBtn">■</button><button data-drive="R">▶</button>
+      <span></span><button data-drive="B">▼</button><span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="label">Messages from the ESP32</p>
+    <div id="log"></div>
+  </div>
+
+  <p class="hint">Works in Chrome on Android (and desktop Chrome/Edge). iPhone Safari does not support Web Bluetooth.</p>
+
+<script>
+  const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+  const TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+  const DEVICE_NAME = 'ESP32-CAR';
+
+  let device = null, rx = null, inbuf = '', active = '';
+  const statusEl = document.getElementById('status');
+  const connectBtn = document.getElementById('connect');
+  const logEl = document.getElementById('log');
+  const progsEl = document.getElementById('progs');
+
+  function log(text) {
+    logEl.textContent += text + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(connected) {
+    statusEl.textContent = connected ? 'Connected to ' + DEVICE_NAME : 'Not connected';
+    statusEl.classList.toggle('on', connected);
+    connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
+    if (!connected) progsEl.innerHTML = '<span class="hint">Connect to load the list.</span>';
+  }
+
+  function highlight() {
+    progsEl.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.name === active));
+  }
+
+  function showPrograms(names) {
+    progsEl.innerHTML = '';
+    if (!names.length) { progsEl.innerHTML = '<span class="hint">No programs found.</span>'; return; }
+    names.forEach(name => {
+      const b = document.createElement('button');
+      b.dataset.name = name;
+      b.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+      b.addEventListener('click', () => send('#RUN:' + name + '\n'));
+      progsEl.appendChild(b);
+    });
+    highlight();
+  }
+
+  function handleLine(line) {
+    line = line.trim();
+    if (!line) return;
+    if (line.startsWith('#PROGS:')) {
+      showPrograms(line.slice(7).split(',').filter(Boolean));
+    } else if (line.startsWith('#ACTIVE:')) {
+      active = line.slice(8);
+      highlight();
+      if (active) log('Running: ' + active);
+    } else if (line.startsWith('#ERR:')) {
+      log('Error: ' + line.slice(5));
+    } else {
+      log(line);
+    }
+  }
+
+  function onData(text) {
+    inbuf += text;
+    let i;
+    while ((i = inbuf.indexOf('\n')) >= 0) {
+      handleLine(inbuf.slice(0, i));
+      inbuf = inbuf.slice(i + 1);
+    }
+  }
+
+  async function send(text) {
+    if (!rx) return;
+    const data = new TextEncoder().encode(text);
+    try {
+      if (rx.writeValueWithoutResponse) await rx.writeValueWithoutResponse(data);
+      else await rx.writeValue(data);
+    } catch (err) {
+      log('Send error: ' + err.message);
+    }
+  }
+
+  async function connect() {
+    if (!navigator.bluetooth) {
+      alert('Web Bluetooth is not supported in this browser. Use Chrome on Android.');
+      return;
+    }
+    try {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: DEVICE_NAME }],
+        optionalServices: [SERVICE]
+      });
+      device.addEventListener('gattserverdisconnected', () => { rx = null; active = ''; setStatus(false); log('Disconnected'); });
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      rx = await service.getCharacteristic(RX_CHAR);
+      const tx = await service.getCharacteristic(TX_CHAR);
+      await tx.startNotifications();
+      tx.addEventListener('characteristicvaluechanged', e => onData(new TextDecoder().decode(e.target.value)));
+      setStatus(true);
+      log('Connected');
+      inbuf = '';
+      setTimeout(() => send('#LIST\n'), 300);
+    } catch (err) {
+      log('Error: ' + err.message);
+    }
+  }
+
+  connectBtn.addEventListener('click', () => {
+    (device && device.gatt.connected) ? device.gatt.disconnect() : connect();
+  });
+  document.getElementById('refresh').addEventListener('click', () => send('#LIST\n'));
+
+  // Drive buttons: hold to move, release to stop
+  document.querySelectorAll('[data-drive]').forEach(btn => {
+    const start = e => { e.preventDefault(); btn.classList.add('active'); send(btn.dataset.drive); };
+    const end = e => { e.preventDefault(); if (btn.classList.contains('active')) { btn.classList.remove('active'); send('S'); } };
+    btn.addEventListener('pointerdown', start);
+    btn.addEventListener('pointerup', end);
+    btn.addEventListener('pointerleave', end);
+    btn.addEventListener('pointercancel', end);
+    btn.addEventListener('contextmenu', e => e.preventDefault());
+  });
+  document.getElementById('stopBtn').addEventListener('click', () => send('S'));
+</script>
+</body>
+</html>
